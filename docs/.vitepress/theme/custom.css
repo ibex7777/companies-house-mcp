@@ -1,4 +1,4 @@
-/* Companies House brand colours */
+/* Companies House brand colours — same blue in light and dark */
 
 :root {
   --vp-c-brand-1: #1f70b9;
@@ -6,22 +6,21 @@
   --vp-c-brand-3: #155496;
   --vp-c-brand-soft: rgba(31, 112, 185, 0.12);
 
-  /* Hero name: solid brand blue in both modes */
   --vp-home-hero-name-color: #1f70b9;
 }
 
 .dark {
-  --vp-c-brand-1: #03ffe0;
-  --vp-c-brand-2: #02e8cc;
-  --vp-c-brand-3: #02cfb6;
-  --vp-c-brand-soft: rgba(3, 255, 224, 0.12);
+  --vp-c-brand-1: #1f70b9;
+  --vp-c-brand-2: #1a62a8;
+  --vp-c-brand-3: #155496;
+  --vp-c-brand-soft: rgba(31, 112, 185, 0.2);
 
-  /* Hero name stays the same blue even in dark mode */
   --vp-home-hero-name-color: #1f70b9;
 }
 
-/* Buttons */
-:root {
+/* Buttons — same blue, white text, both modes */
+:root,
+.dark {
   --vp-button-brand-border: transparent;
   --vp-button-brand-text: #ffffff;
   --vp-button-brand-bg: #1f70b9;
@@ -31,13 +30,6 @@
   --vp-button-brand-active-border: transparent;
   --vp-button-brand-active-text: #ffffff;
   --vp-button-brand-active-bg: #155496;
-}
-
-.dark {
-  --vp-button-brand-text: #000000;
-  --vp-button-brand-bg: #03ffe0;
-  --vp-button-brand-hover-bg: #02e8cc;
-  --vp-button-brand-active-bg: #02cfb6;
 }
 
 /* Hero image: no default background circle */
