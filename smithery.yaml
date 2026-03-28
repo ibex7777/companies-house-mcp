@@ -1,0 +1,19 @@
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required:
+      - apiKey
+    properties:
+      apiKey:
+        type: string
+        title: API Key
+        description: Free API key from developer.company-information.service.gov.uk
+  commandFunction: |-
+    (config) => ({
+      command: "npx",
+      args: ["-y", "companies-house-mcp"],
+      env: {
+        COMPANIES_HOUSE_API_KEY: config.apiKey
+      }
+    })
