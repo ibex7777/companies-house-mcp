@@ -16,6 +16,9 @@ docs/.vitepress/cache/
 .env
 .env.local
 
+# MCP publisher auth tokens
+.mcpregistry_*
+
 # IDE files
 .vscode/settings.json
 .cursor/
