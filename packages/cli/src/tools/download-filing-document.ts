@@ -11,18 +11,18 @@
  *   2. GET  /document/{document_id}/content     -> 302 redirect to a signed
  *                                                  S3 URL containing the file
  *
- * This tool performs both steps, writes the resulting bytes to a file, and
- * returns the local file path (plus content-type/size) so downstream tooling
- * can read, parse or email the document.
+ * This tool performs both steps and then EITHER:
+ *   - writes the bytes to a file on the server's disk and returns the local
+ *     path (default — `return_as: 'file_path'`); or
+ *   - returns the bytes inline as a base64 string in the response payload
+ *     (`return_as: 'base64'`), which is what you want when the MCP server
+ *     runs on a different machine to the caller (e.g. hosted on Fly.io and
+ *     accessed over HTTP via mcp-remote).
  *
- * Save location precedence (highest first):
+ * Save location precedence (file_path mode only):
  *   1. `save_dir` parameter on the call
  *   2. `COMPANIES_HOUSE_DOWNLOAD_DIR` environment variable
  *   3. OS temp directory (the historical default)
- *
- * Drop this file into packages/cli/src/tools/ and add a matching
- * `import '../tools/download-filing-document.js';` line to
- * packages/cli/src/server/index.ts — see PATCH.md for the one-line change.
  */
 
 import { z } from 'zod';
@@ -89,6 +89,17 @@ const shape = {
         'return the requested format if available and otherwise fall back ' +
         'to whatever it holds.',
     ),
+  return_as: z
+    .enum(['file_path', 'base64'])
+    .default('file_path')
+    .describe(
+      'How to return the document. "file_path" (default) writes the bytes ' +
+        'to disk on the server and returns the local path — works when ' +
+        'the MCP server runs on the same machine as the caller (stdio ' +
+        'mode). "base64" returns the bytes inline as a base64 string in ' +
+        'the response payload — required when the server is remote (HTTP) ' +
+        'and the caller has no access to the server filesystem.',
+    ),
   company_number: z
     .string()
     .optional()
@@ -107,10 +118,11 @@ const shape = {
     .string()
     .optional()
     .describe(
-      'Optional absolute path to save the downloaded file into. Overrides ' +
-        'the `COMPANIES_HOUSE_DOWNLOAD_DIR` env var and the OS temp ' +
-        'directory default. The directory will be created if it does not ' +
-        'already exist.',
+      'Optional absolute path to save the downloaded file into (file_path ' +
+        'mode only). Overrides the `COMPANIES_HOUSE_DOWNLOAD_DIR` env var ' +
+        'and the OS temp directory default. The directory will be created ' +
+        'if it does not already exist. Ignored when `return_as` is ' +
+        '"base64".',
     ),
 };
 const schema = z.object(shape);
@@ -247,12 +259,12 @@ registerTool({
   name: 'download_filing_document',
   description:
     'Download the actual filed document (PDF / XHTML / XML / JSON) for a ' +
-    'Companies House filing history item via the Document API and save it ' +
-    'to disk. Returns the file path, detected content-type and size in ' +
-    'bytes. Pair this with `get_filings` — take the `links.' +
-    'document_metadata` value from a filing and pass its final path segment ' +
-    'as `document_id`. Save location: explicit `save_dir` param > ' +
-    '`COMPANIES_HOUSE_DOWNLOAD_DIR` env var > OS temp directory.',
+    'Companies House filing history item via the Document API. By default ' +
+    'writes to disk on the server and returns the file path; pass ' +
+    '`return_as: "base64"` to get the bytes inline (required for remote ' +
+    'MCP servers). Pair with `get_filings` — take the `links.' +
+    'document_metadata` value from a filing and pass its final path ' +
+    'segment as `document_id`.',
   inputSchema: shape,
   annotations: TOOL_ANNOTATIONS,
   async execute(_client: APIClient, params: unknown) {
@@ -274,6 +286,37 @@ registerTool({
         apiKey,
       );
 
+      const commonPayload: Record<string, unknown> = {
+        content_type: contentType,
+        size_bytes: buffer.byteLength,
+        document_id: documentId,
+        requested_format: input.format,
+        ...(input.company_number
+          ? { company_number: input.company_number }
+          : {}),
+        ...(input.transaction_id
+          ? { transaction_id: input.transaction_id }
+          : {}),
+        ...(metadata ? { metadata } : {}),
+      };
+
+      // ---- base64 mode: return the bytes inline, no disk write.
+      if (input.return_as === 'base64') {
+        const payload = {
+          ...commonPayload,
+          return_as: 'base64',
+          content_base64: buffer.toString('base64'),
+        };
+        const summary =
+          `Returning ${buffer.byteLength.toLocaleString()} bytes ` +
+          `(${contentType}) inline as base64. Decode with e.g. ` +
+          `\`echo "$content_base64" | base64 -d > out.${
+            FORMAT_EXTENSION[input.format] ?? 'bin'
+          }\`.`;
+        return makeTextResult(summary, payload);
+      }
+
+      // ---- file_path mode (default): write to disk, return the path.
       const ext = FORMAT_EXTENSION[input.format] ?? 'bin';
       const companyPart = input.company_number ? `${input.company_number}_` : '';
       const txnPart = input.transaction_id ? `${input.transaction_id}_` : '';
@@ -286,8 +329,6 @@ registerTool({
         input.save_dir,
       );
 
-      // Make sure the target directory exists. `recursive: true` is a no-op
-      // if it's already there and creates intermediate paths if it isn't.
       try {
         await mkdir(saveDir, { recursive: true });
       } catch (err) {
@@ -297,25 +338,15 @@ registerTool({
       }
 
       const filePath = join(saveDir, filename);
-
       await writeFile(filePath, buffer);
 
-      const payload: Record<string, unknown> = {
+      const payload = {
+        ...commonPayload,
+        return_as: 'file_path',
         file_path: filePath,
         filename,
         save_dir: saveDir,
         save_dir_source: saveDirSource,
-        content_type: contentType,
-        size_bytes: buffer.byteLength,
-        document_id: documentId,
-        requested_format: input.format,
-        ...(input.company_number
-          ? { company_number: input.company_number }
-          : {}),
-        ...(input.transaction_id
-          ? { transaction_id: input.transaction_id }
-          : {}),
-        ...(metadata ? { metadata } : {}),
       };
 
       const summary =
