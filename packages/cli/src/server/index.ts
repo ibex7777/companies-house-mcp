@@ -18,6 +18,7 @@ import '../tools/filings.js';
 import '../tools/financial.js';
 import '../tools/extended.js';
 import '../tools/composite.js';
+import '../tools/download-filing-document.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const { version } = JSON.parse(
