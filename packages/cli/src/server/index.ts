@@ -3,6 +3,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { APIClient } from '../api/client.js';
@@ -55,6 +56,61 @@ function readRequestBody(req: {
   });
 }
 
+/** Constant-time string compare so /token's client_secret check doesn't
+ *  leak timing info. Both inputs must be the same byte length; if not,
+ *  we hash them first and compare hashes. */
+function safeStringEqual(a: string, b: string): boolean {
+  const ba = Buffer.from(a, 'utf-8');
+  const bb = Buffer.from(b, 'utf-8');
+  if (ba.length !== bb.length) {
+    // Different lengths can never match. Still run a constant-time op
+    // on equal-length hashes to avoid timing differences between this
+    // branch and the equal-length branch below.
+    const ha = createHash('sha256').update(ba).digest();
+    const hb = createHash('sha256').update(bb).digest();
+    timingSafeEqual(ha, hb);
+    return false;
+  }
+  return timingSafeEqual(ba, bb);
+}
+
+/** Build a stateless OAuth authorization code: a base64url-encoded JSON
+ *  payload joined to an HMAC signature. Verifying the signature later is
+ *  enough to trust the payload — no server-side store is needed. This
+ *  works across Fly's HA pair because both machines share the signing
+ *  secret via env var. */
+function makeAuthCode(
+  payload: Record<string, unknown>,
+  signingKey: string,
+): string {
+  const json = JSON.stringify(payload);
+  const body = Buffer.from(json, 'utf-8').toString('base64url');
+  const sig = createHmac('sha256', signingKey).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+
+/** Verify an auth code's HMAC signature and return the decoded payload,
+ *  or null if the signature doesn't match / the code is malformed. */
+function verifyAuthCode(
+  code: string,
+  signingKey: string,
+): Record<string, unknown> | null {
+  const dotIdx = code.lastIndexOf('.');
+  if (dotIdx < 0) return null;
+  const body = code.slice(0, dotIdx);
+  const sig = code.slice(dotIdx + 1);
+  const expectedSig = createHmac('sha256', signingKey)
+    .update(body)
+    .digest('base64url');
+  if (!safeStringEqual(sig, expectedSig)) return null;
+  try {
+    const json = Buffer.from(body, 'base64url').toString('utf-8');
+    return JSON.parse(json) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const isHttp = args.includes('--http');
@@ -102,18 +158,16 @@ async function main(): Promise<void> {
     const port = portArg ? parseInt(portArg, 10) : 3000;
     const expectedToken = process.env.MCP_BEARER_TOKEN?.trim();
 
-    // OAuth (client_credentials grant) — optional, enabled when both
-    // MCP_OAUTH_CLIENT_ID and MCP_OAUTH_CLIENT_SECRET are set. This lets
-    // clients that don't support a manually-pasted bearer header (e.g.
-    // Claude desktop's Custom Connector UI) authenticate via OAuth and
-    // receive an access token that is identical to MCP_BEARER_TOKEN.
+    // OAuth — optional, enabled when both MCP_OAUTH_CLIENT_ID and
+    // MCP_OAUTH_CLIENT_SECRET are set. Supports two grants:
+    //  - client_credentials  (server-to-server, e.g. curl tests)
+    //  - authorization_code  (with PKCE, used by Claude desktop's
+    //                         Custom Connector UI)
+    // Issued access tokens equal MCP_BEARER_TOKEN, so the existing /mcp
+    // bearer-auth check accepts both manual and OAuth-issued tokens.
     const oauthClientId = process.env.MCP_OAUTH_CLIENT_ID?.trim();
     const oauthClientSecret = process.env.MCP_OAUTH_CLIENT_SECRET?.trim();
     const oauthEnabled = Boolean(oauthClientId && oauthClientSecret);
-    // Optional override for the public URL announced in OAuth discovery
-    // metadata. Falls back to deriving it from the request headers, which
-    // works when the server sits behind Fly's edge (which sets
-    // X-Forwarded-Proto correctly).
     const publicUrlOverride = process.env.MCP_PUBLIC_URL?.trim();
 
     if (!expectedToken) {
@@ -130,6 +184,11 @@ async function main(): Promise<void> {
       );
       process.exit(1);
     }
+
+    // Used to sign authorization codes. Reusing the bearer token as the
+    // HMAC key is fine for a single-user server: anyone who can read it
+    // could also read access tokens directly.
+    const codeSigningKey = expectedToken ?? '';
 
     const httpServer = http.createServer(async (req, res) => {
       const url = new URL(req.url ?? '/', `http://localhost:${port}`);
@@ -161,7 +220,7 @@ async function main(): Promise<void> {
         return;
       }
 
-      // ---- OAuth: discovery metadata
+      // ---- OAuth: discovery metadata ------------------------------------
       if (url.pathname === '/.well-known/oauth-authorization-server') {
         if (!oauthEnabled) {
           res.writeHead(404);
@@ -169,8 +228,7 @@ async function main(): Promise<void> {
           return;
         }
         const proto =
-          (req.headers['x-forwarded-proto'] as string | undefined) ??
-          'http';
+          (req.headers['x-forwarded-proto'] as string | undefined) ?? 'http';
         const host =
           (req.headers.host as string | undefined) ?? `localhost:${port}`;
         const issuer = publicUrlOverride || `${proto}://${host}`;
@@ -181,19 +239,154 @@ async function main(): Promise<void> {
         res.end(
           JSON.stringify({
             issuer,
+            authorization_endpoint: `${issuer}/oauth/authorize`,
             token_endpoint: `${issuer}/oauth/token`,
-            grant_types_supported: ['client_credentials'],
+            response_types_supported: ['code'],
+            grant_types_supported: [
+              'authorization_code',
+              'client_credentials',
+            ],
+            code_challenge_methods_supported: ['S256', 'plain'],
             token_endpoint_auth_methods_supported: [
               'client_secret_basic',
               'client_secret_post',
+              'none',
             ],
-            response_types_supported: [],
+            scopes_supported: ['mcp'],
           }),
         );
         return;
       }
 
-      // ---- OAuth: token endpoint
+      // ---- OAuth: authorization endpoint --------------------------------
+      // Single-user server: validate the request, mint a signed code, and
+      // 302 back to the redirect_uri. There's no login UI because there's
+      // only one user; possession of client_id is treated as approval.
+      if (url.pathname === '/oauth/authorize') {
+        if (!oauthEnabled) {
+          res.writeHead(404);
+          res.end('Not Found');
+          return;
+        }
+        if (req.method !== 'GET') {
+          res.writeHead(405, { Allow: 'GET' });
+          res.end('Method Not Allowed');
+          return;
+        }
+
+        const q = url.searchParams;
+        const responseType = q.get('response_type');
+        const reqClientId = q.get('client_id');
+        const redirectUri = q.get('redirect_uri');
+        const state = q.get('state') ?? '';
+        const codeChallenge = q.get('code_challenge') ?? '';
+        const codeChallengeMethod = q.get('code_challenge_method') ?? 'plain';
+        const scope = q.get('scope') ?? '';
+
+        // Helper: redirect back to the client with an OAuth-style error.
+        const redirectError = (code: string, description: string) => {
+          if (!redirectUri) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({ error: code, error_description: description }),
+            );
+            return;
+          }
+          let target: URL;
+          try {
+            target = new URL(redirectUri);
+          } catch {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                error: 'invalid_request',
+                error_description: 'Malformed redirect_uri',
+              }),
+            );
+            return;
+          }
+          target.searchParams.set('error', code);
+          target.searchParams.set('error_description', description);
+          if (state) target.searchParams.set('state', state);
+          res.writeHead(302, { Location: target.toString() });
+          res.end();
+        };
+
+        if (!reqClientId || reqClientId !== oauthClientId) {
+          // Per RFC 6749 §4.1.2.1, an unknown client_id should NOT
+          // redirect — return a direct error to avoid open-redirect risk.
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              error: 'invalid_client',
+              error_description: 'Unknown client_id',
+            }),
+          );
+          return;
+        }
+        if (!redirectUri) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              error: 'invalid_request',
+              error_description: 'Missing redirect_uri',
+            }),
+          );
+          return;
+        }
+        if (responseType !== 'code') {
+          redirectError(
+            'unsupported_response_type',
+            'Only response_type=code is supported',
+          );
+          return;
+        }
+        if (
+          codeChallengeMethod !== 'S256' &&
+          codeChallengeMethod !== 'plain'
+        ) {
+          redirectError(
+            'invalid_request',
+            'Unsupported code_challenge_method',
+          );
+          return;
+        }
+
+        // Mint a 10-minute auth code containing everything we'll need to
+        // verify the subsequent /oauth/token request.
+        const code = makeAuthCode(
+          {
+            cid: reqClientId,
+            rdi: redirectUri,
+            cch: codeChallenge,
+            ccm: codeChallengeMethod,
+            sco: scope,
+            exp: Date.now() + 10 * 60 * 1000,
+          },
+          codeSigningKey,
+        );
+
+        let target: URL;
+        try {
+          target = new URL(redirectUri);
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              error: 'invalid_request',
+              error_description: 'Malformed redirect_uri',
+            }),
+          );
+          return;
+        }
+        target.searchParams.set('code', code);
+        if (state) target.searchParams.set('state', state);
+        res.writeHead(302, { Location: target.toString() });
+        res.end();
+        return;
+      }
+
+      // ---- OAuth: token endpoint ---------------------------------------
       if (url.pathname === '/oauth/token') {
         if (!oauthEnabled) {
           res.writeHead(404);
@@ -230,9 +423,10 @@ async function main(): Promise<void> {
         const params = new URLSearchParams(bodyText);
 
         // Client credentials may arrive via HTTP Basic auth header
-        // (RFC 6749 §2.3.1) or in the request body.
-        let clientId: string | undefined;
-        let clientSecret: string | undefined;
+        // (RFC 6749 §2.3.1) or in the request body. PKCE-only
+        // public clients may omit the secret entirely.
+        let reqClientId: string | undefined;
+        let reqClientSecret: string | undefined;
 
         const authHeader =
           (req.headers.authorization as string | undefined) ?? '';
@@ -244,64 +438,219 @@ async function main(): Promise<void> {
             );
             const colonIdx = decoded.indexOf(':');
             if (colonIdx >= 0) {
-              clientId = decodeURIComponent(decoded.slice(0, colonIdx));
-              clientSecret = decodeURIComponent(decoded.slice(colonIdx + 1));
+              reqClientId = decodeURIComponent(decoded.slice(0, colonIdx));
+              reqClientSecret = decodeURIComponent(
+                decoded.slice(colonIdx + 1),
+              );
             }
           } catch {
             /* fall through to body credentials */
           }
         }
-        if (!clientId) clientId = params.get('client_id') ?? undefined;
-        if (!clientSecret)
-          clientSecret = params.get('client_secret') ?? undefined;
+        if (!reqClientId) reqClientId = params.get('client_id') ?? undefined;
+        if (!reqClientSecret)
+          reqClientSecret = params.get('client_secret') ?? undefined;
 
-        if (
-          !clientId ||
-          !clientSecret ||
-          clientId !== oauthClientId ||
-          clientSecret !== oauthClientSecret
-        ) {
-          res.writeHead(401, {
+        const grantType = params.get('grant_type');
+
+        // Helper used by both grants to issue the access token.
+        const issueToken = () => {
+          res.writeHead(200, {
             'Content-Type': 'application/json',
-            'WWW-Authenticate': 'Basic',
+            'Cache-Control': 'no-store',
+            Pragma: 'no-cache',
+            'Access-Control-Allow-Origin': '*',
           });
           res.end(
             JSON.stringify({
-              error: 'invalid_client',
-              error_description: 'Unknown client_id or client_secret',
+              access_token: expectedToken,
+              token_type: 'Bearer',
+              expires_in: 3600,
             }),
           );
+        };
+
+        if (grantType === 'client_credentials') {
+          if (
+            !reqClientId ||
+            !reqClientSecret ||
+            !oauthClientId ||
+            !oauthClientSecret ||
+            !safeStringEqual(reqClientId, oauthClientId) ||
+            !safeStringEqual(reqClientSecret, oauthClientSecret)
+          ) {
+            res.writeHead(401, {
+              'Content-Type': 'application/json',
+              'WWW-Authenticate': 'Basic',
+            });
+            res.end(
+              JSON.stringify({
+                error: 'invalid_client',
+                error_description: 'Unknown client_id or client_secret',
+              }),
+            );
+            return;
+          }
+          issueToken();
           return;
         }
 
-        const grantType = params.get('grant_type');
-        if (grantType !== 'client_credentials') {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(
-            JSON.stringify({
-              error: 'unsupported_grant_type',
-              error_description:
-                'Only client_credentials grant is supported by this server',
-            }),
-          );
+        if (grantType === 'authorization_code') {
+          const code = params.get('code') ?? '';
+          const codeVerifier = params.get('code_verifier') ?? '';
+          const redirectUri = params.get('redirect_uri') ?? '';
+
+          if (!code) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                error: 'invalid_request',
+                error_description: 'Missing code',
+              }),
+            );
+            return;
+          }
+          const payload = verifyAuthCode(code, codeSigningKey);
+          if (!payload) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                error: 'invalid_grant',
+                error_description: 'Invalid authorization code signature',
+              }),
+            );
+            return;
+          }
+
+          const exp = typeof payload.exp === 'number' ? payload.exp : 0;
+          if (Date.now() > exp) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                error: 'invalid_grant',
+                error_description: 'Authorization code expired',
+              }),
+            );
+            return;
+          }
+
+          const expectedClientId = String(payload.cid ?? '');
+          if (
+            !reqClientId ||
+            !oauthClientId ||
+            !safeStringEqual(reqClientId, expectedClientId) ||
+            !safeStringEqual(expectedClientId, oauthClientId)
+          ) {
+            res.writeHead(401, {
+              'Content-Type': 'application/json',
+              'WWW-Authenticate': 'Basic',
+            });
+            res.end(
+              JSON.stringify({
+                error: 'invalid_client',
+                error_description: 'client_id mismatch',
+              }),
+            );
+            return;
+          }
+
+          // Confidential clients (those that registered a secret) must
+          // present it. Public clients (PKCE-only) may omit the secret.
+          // Since we only have one configured client and it has a secret,
+          // we accept either: secret present and matches, OR secret
+          // absent + valid PKCE (checked below).
+          if (reqClientSecret) {
+            if (
+              !oauthClientSecret ||
+              !safeStringEqual(reqClientSecret, oauthClientSecret)
+            ) {
+              res.writeHead(401, {
+                'Content-Type': 'application/json',
+                'WWW-Authenticate': 'Basic',
+              });
+              res.end(
+                JSON.stringify({
+                  error: 'invalid_client',
+                  error_description: 'Bad client_secret',
+                }),
+              );
+              return;
+            }
+          }
+
+          const expectedRedirectUri = String(payload.rdi ?? '');
+          if (
+            !redirectUri ||
+            !safeStringEqual(redirectUri, expectedRedirectUri)
+          ) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                error: 'invalid_grant',
+                error_description: 'redirect_uri mismatch',
+              }),
+            );
+            return;
+          }
+
+          // PKCE verification — required if the original /authorize
+          // request included a code_challenge.
+          const challenge = String(payload.cch ?? '');
+          const challengeMethod = String(payload.ccm ?? 'plain');
+          if (challenge) {
+            if (!codeVerifier) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(
+                JSON.stringify({
+                  error: 'invalid_grant',
+                  error_description: 'Missing code_verifier',
+                }),
+              );
+              return;
+            }
+            let derived: string;
+            if (challengeMethod === 'S256') {
+              derived = createHash('sha256')
+                .update(codeVerifier, 'utf-8')
+                .digest('base64url');
+            } else {
+              derived = codeVerifier;
+            }
+            if (!safeStringEqual(derived, challenge)) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(
+                JSON.stringify({
+                  error: 'invalid_grant',
+                  error_description: 'PKCE verification failed',
+                }),
+              );
+              return;
+            }
+          } else if (!reqClientSecret) {
+            // No PKCE and no client secret — not allowed.
+            res.writeHead(401, {
+              'Content-Type': 'application/json',
+            });
+            res.end(
+              JSON.stringify({
+                error: 'invalid_client',
+                error_description:
+                  'Public clients must use PKCE; confidential clients must present client_secret',
+              }),
+            );
+            return;
+          }
+
+          issueToken();
           return;
         }
 
-        // Issue an access token. We re-use the static MCP_BEARER_TOKEN
-        // value as the access token, which means the existing /mcp
-        // bearer-auth check accepts OAuth-issued tokens with no extra
-        // logic. expires_in is advisory; the server doesn't actually
-        // expire tokens (the static bearer never expires).
-        res.writeHead(200, {
-          'Content-Type': 'application/json',
-          'Cache-Control': 'no-store',
-          Pragma: 'no-cache',
-        });
+        // Unknown / missing grant_type
+        res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(
           JSON.stringify({
-            access_token: expectedToken,
-            token_type: 'Bearer',
-            expires_in: 3600,
+            error: 'unsupported_grant_type',
+            error_description: `Grant type '${grantType ?? ''}' is not supported`,
           }),
         );
         return;
@@ -386,8 +735,10 @@ async function main(): Promise<void> {
       }
       if (oauthEnabled) {
         console.error(
-          'OAuth: enabled — client_credentials grant accepted at /oauth/token',
+          'OAuth: enabled (authorization_code + client_credentials grants)',
         );
+        console.error(`OAuth authorize: http://localhost:${port}/oauth/authorize`);
+        console.error(`OAuth token:     http://localhost:${port}/oauth/token`);
         console.error(
           `OAuth discovery: http://localhost:${port}/.well-known/oauth-authorization-server`,
         );
